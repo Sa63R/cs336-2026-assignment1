@@ -161,3 +161,50 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environment
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Downloaded datasets
+data/
+
+# Training outputs
+checkpoints/
+outputs/
+artifacts/
+runs/
+wandb/
+logs/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+*~
+
+# Notebook caches
+.ipynb_checkpoints/
+
+# Generated submissions
+submission/
+*.zip
+*.tar.gz
