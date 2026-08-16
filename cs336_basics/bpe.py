@@ -10,7 +10,7 @@ def merge_pair(
 )->tuple[bytes,...]:
     result = []
     i = 0
-    while i < len(toekns):
+    while i < len(tokens):
         if(
             i<len(tokens)-1
             and tokens[i] == pair[0]
@@ -57,7 +57,7 @@ def train_bpe(
         chunks = [text]
 
     word_counts = Counter()
-    pair_counts = Counter()
+    
     merges = []
 
     for chunk in chunks:
@@ -69,30 +69,50 @@ def train_bpe(
 
     # word_counts是一个Counter对象，key是tuple(bytes([b1]), bytes([b2]), ...)，value是出现次数
     # 下一步开始BPE
-    for tokens, freq in word_counts.items():
-        # 遍历字典的方法
-        # 然后需要遍历取出来的tuple进行计数
-        for pair in zip(tokens,tokens[1:]):
-            pair_counts[pair] += freq
 
-    # 现在就有了每一个小pair的计数 
+    while len(vocab)<vocab_size:
 
-    # print(pair_counts.most_common(20)) # 测试当前pre-tokenizer是否正确
-    # uv run --locked python -c 'from cs336_basics.bpe import train_bpe; train_bpe("tests/fixtures/corpus.en", 500, ["<|endoftext|>"])'
-
-    ## 然后是BPEmerge
-    best_pair = max(
-        pair_counts,
-        key=lambda pair:(pair_counts[pair],pair)
-    )
-    # best_pair 是一个元组
-
-    new_token = best_pair[0]+best_pair[1]
-    # 用一个list来记录合并过程
-    merges.append(best_pair)
-
-    vocab[len(vocab)] = new_token
+        pair_counts = Counter()
+        for tokens, freq in word_counts.items():
+            # 遍历字典的方法
+            # 然后需要遍历取出来的tuple进行计数
+            for pair in zip(tokens,tokens[1:]):
+                pair_counts[pair] += freq
+        # 如果已经没有任何 pair 可以合并了
+        if not pair_counts:
+            break
 
 
+        # 现在就有了每一个小pair的计数 
 
-    raise NotImplementedError
+        # print(pair_counts.most_common(20)) # 测试当前pre-tokenizer是否正确
+        # uv run --locked python -c 'from cs336_basics.bpe import train_bpe; train_bpe("tests/fixtures/corpus.en", 500, ["<|endoftext|>"])'
+
+        ## 然后是BPEmerge
+        best_pair = max(
+            pair_counts,
+            key=lambda pair:(pair_counts[pair],pair)
+        )
+        # best_pair 是一个元组
+    
+        # 之所以要有new_token是因为vocab这个dict里面的value是bytes，所以需要对齐
+        new_token = best_pair[0]+best_pair[1]
+        # 用一个list来记录合并过程
+        merges.append(best_pair)
+
+        # 之所以要有new_token是因为vocab这个dict里面的value是bytes，所以需要对齐
+        vocab[len(vocab)] = new_token
+
+        new_word_counts = Counter()
+
+        for tokens, freq in word_counts.items():
+            new_tokens = merge_pair(tokens,best_pair)
+            new_word_counts[new_tokens] += freq
+
+        # 更新进入下一轮
+        word_counts = new_word_counts
+
+
+
+
+    return vocab, merges
