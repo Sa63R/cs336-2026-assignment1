@@ -1,8 +1,37 @@
+from __future__ import annotations
 import os
+from collections import Counter,defaultdict
+import heapq
+import multiprocessing as mp
+from typing import BinaryIO
+
 import regex
-from collections import Counter
+
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+PRETOKEN_RE = regex.compile(PAT)
+
+class _HeapItem:
+    """让heapq按照频率最大、pair 字典序最大的顺序返回元素。"""
+
+    __slots__ = ("frequency","pair")
+    def __init__(
+        self,
+        frequency: int,
+        pair: tuple[bytes,bytes],
+    )-> None:
+        self.frequency = frequency
+        self.pair = pair
+
+    def __lt__(self, other:_HeapItem)-> bool:
+        return (self.frequency,self.pair)>(
+            other.frequency,
+            other.pair,
+        )
+
+
+        
+        
 
 def merge_pair(
         tokens: tuple[bytes,...],
@@ -24,7 +53,282 @@ def merge_pair(
 
     return tuple(result)
 
+def find_chunk_boundaries(
+        file: BinaryIO,
+        desired_num_chunks: int,
+        split_special_tokens: bytes,
+)->list[int]:
+    """
+    先把一个大文件粗略地等分成若干块，
+    然后把每个“粗略分界点”向后移动到最近的特殊 token（例如 <|endoftext|>）的位置，
+    从而得到适合多进程处理的安全边界。
+    """
+    assert isinstance(split_special_tokens,bytes,)
+
+    # 计算文件大小file_size
+    file.seek(0,os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    boundaries = [
+        i * chunk_size
+        for i in range(desired_num_chunks+1)
+    ]
+    boundaries[-1] = file_size
+
+    mini_chunk_size = 4096
+
+    for boundary_index in range(
+        1,
+        len(boundaries) - 1,
+    ):
+        position = boundaries[boundary_index]
+        file.seek(position)
+
+        while True:
+            mini_chunk = file.read(mini_chunk_size)
+
+            # 如果最后读到空了，那么就设置当前分块边界为文件的末尾
+            if mini_chunk == b"":
+                boundaries[boundary_index] = file_size
+                break
+
+            # 在切分的4096块里寻找special token
+            found_at = mini_chunk.find(
+                split_special_tokens
+            )
+
+            if found_at != -1: # 找到了
+                boundaries[boundary_index] = position + found_at
+                break
+
+                position = position + mini_chunk_size
+
+    return sorted(set(boundaries))
+
+def _compile_special_pattern(
+    special_tokens: tuple[str,...],
+)-> regex.Pattern | None:
+    """构造特殊词元的正则表达式"""
+    if not special_tokens:
+        return None
+
+    alternatives = "|".join(
+        regex.escape(token)
+        for token in sorted(
+            special_tokens,
+            key=len,
+            reverse=True,   
+        )
+    )
+    return regex.compile(alternatives)
+
+def _count_ordinary_text(
+        text: str,
+        counts: Counter[bytes],
+        start: int = 0,
+        end: int | None = None,
+)->None:
+    """对指定文本范围执行预分词并统计频率。"""
+
+    for match in PRETOKEN_RE.finditer(
+        text,
+        start,
+        end,
+    ):
+        pretoken_bytes = (
+            match.group().encode("utf-8")
+        )
+        counts[pretoken_bytes] += 1
+
+
+# 这里的思想大概是一层层处理，一个处理外层分块，一个函数处理有分词token的快内，再一个函数处理最普通的部分。
+
+# 下面这部分是用来处理一个分块内部的文本
+
+def _count_pretokens_chunk(
+        task: tuple[
+            str,
+            int,
+            int,
+            tuple[str,...],
+        ],
+)->Counter[bytes]:
+    """
+    多进程工作函数。
+
+    每个工作进程自行读取指定文件区间，
+    """
+
+    # 解包元组
+
+    (
+        input_path,
+        start,
+        end,
+        special_tokens,
+    ) = task
+
+    with open(input_path,"rb") as file:
+        file.seek(start)
+        chunk_bytes = file.read(end - start)
+
+    text = chunk_bytes.decode("utf-8")
+    counts: Counter[bytes] = Counter()
+
+    special_pattern = _compile_special_pattern(
+        special_tokens
+    )
+
+    if special_pattern is None:
+        _count_ordinary_text(
+            text,counts
+        )
+        return counts
+
+    # else
+
+    cursor = 0
+
+    for special_match in special_pattern.finditer(
+        text
+    ):
+    # 手动过虑这一段下的特殊分词符
+        _count_ordinary_text(
+            text,
+            counts,
+            cursor,
+            special_match.start(),
+        )
+        cursor = special_match.end()
+    _count_ordinary_text(
+        text,
+        counts,
+        cursor,
+        len(text),# 文本长度，表示这一段结尾部分的cursor坐标
+    )
+    # 返回一个计数完这一段的counts统计值
+    return counts
+
+def _count_pretokens(
+        input_path: str | os.PathLike,
+        special_tokens: tuple[str,...],
+        num_processes: int,
+        parallel_min_bytes: int,
+        num_chunks:int,
+) -> Counter[bytes]:
+    """
+    根据文件大小选择串行或并行预分词。
+    为处理输入文件的第一步
+    """
+    path = os.fspath(input_path)
+    file_size = os.path.getsize(path)
+
+    if (
+        num_processes <= 1
+        or file_size < parallel_min_bytes
+        or not special_tokens
+    ):
+        return _count_pretokens_chunk(
+            (
+            path,
+            0,
+            file_size,
+            special_tokens,
+            )
+        )
+
+    # 上面是不开多线程，现在开。
+    split_token = max(
+        special_tokens,
+        key=len
+    ).encode("utf-8")
+
+    with open(path,"rb") as file:
+        boundaries = find_chunk_boundaries(
+            file,
+            num_chunks,
+            split_token,
+        )
+
+    # 划分多线程任务
+    tasks = [
+        (
+            path,
+            start,
+            end,
+            special_tokens,
+        )
+        for start,end in zip(
+            boundaries[:-1],
+            boundaries[1:],
+        )
+        if start < end
+    ]
+
+    total_counts: Counter[bytes] = Counter()
+
+    context = mp.get_context("fork")
+
+    process_count = min(
+        num_processes,
+        len(tasks),
+    )
+
+    # 类似于打开文件，构建一个线程池
+
+    with context.Pool(
+        processes=process_count
+    ) as pool:
+        partial_results = pool.imap_unordered(
+            _count_pretokens_chunk,
+            tasks,# 这里是接受一个迭代器/可迭代对象？作为输入参数，非常合适
+            chunksize=1,
+        )
+    for partial_counts in partial_results:
+        total_counts.update(partial_counts)
+
+    return total_counts
+
+
+def _adjacent_pair_counts(
+    tokens: tuple[bytes,...],
+) -> Counter[tuple[bytes,bytes]]:
+    
+    return Counter(
+        zip(tokens,tokens[1:])
+    )
+
+def _pop_best_pair(
+    heap: list[_HeapItem],
+    pair_counts: Counter[
+        tuple[bytes,bytes]
+    ],
+) -> tuple[bytes,bytes] | None:
+    """
+    取出当前最高频 pair。
+
+    堆中可能保留旧频率记录，因此需要检查记录是否仍然有效。
+    
+    """
+
+    while heap:
+        item = heapq.heappop(heap)
+
+        current_frequency = pair_counts.get(
+            item.pair,
+            0,
+        )
         
+        if (
+            item.frequency > 0
+            and item.frequency
+            == current_frequency
+        ):
+            return item.pair
+    return None
 
 
 def train_bpe(
@@ -32,87 +336,204 @@ def train_bpe(
     vocab_size: int,
     special_tokens: list[str],
     **kwargs,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+) ->tuple[
+    dict[int,bytes],
+    list[tuple[bytes,bytes]],# 返回一个词表和一个合并过程list
+]:
+    """
+    训练字节级 BPE 分词器。
 
-    vocab = {}
+    可选参数：
+        num_processes:
+            预分词使用的进程数，默认最多为 8。
 
-    for i in range(256):
-        vocab[i] = bytes([i])
-    for tokens in special_tokens:
-        vocab[len(vocab)] = tokens.encode("utf-8")
+        parallel_min_bytes:
+            文件达到多少字节后启用多进程，
+            默认值为 8 MiB。
 
-    # vocabulary is initialized
-
-    with open(input_path, "r", encoding="utf-8") as f:
-        text = f.read()
-
-    # 取得了语料text
-    if special_tokens:
-        special_pattern = "|".join(
-            regex.escape(token)
-            for token in sorted(special_tokens, key=len, reverse=True)
-        )
-        chunks = regex.split(special_pattern, text)
-    else:
-        chunks = [text]
-
-    word_counts = Counter()
+        num_chunks:
+            文件任务分块数量，
+            默认值是进程数的 4 倍。
     
-    merges = []
+    """
+    # 把list转元组 
+    special_tokens_tuple = tuple(
+        special_tokens
+    )
+    vocab: dict[int,bytes] = {
+        byte_value:bytes([byte_value])
+        for byte_value in range(256)
+    }
 
-    for chunk in chunks:
-        for match in regex.finditer(PAT,chunk):
-            pretoken = match.group()
-            encoded = pretoken.encode("utf-8")
-            byte_tuple = tuple(bytes([b]) for b in encoded) # bytes的本质是一个list[1,2,3,...]
-            word_counts[byte_tuple] += 1
+    existing_tokens = set(vocab.values())
 
-    # word_counts是一个Counter对象，key是tuple(bytes([b1]), bytes([b2]), ...)，value是出现次数
-    # 下一步开始BPE
-
-    while len(vocab)<vocab_size:
-
-        pair_counts = Counter()
-        for tokens, freq in word_counts.items():
-            # 遍历字典的方法
-            # 然后需要遍历取出来的tuple进行计数
-            for pair in zip(tokens,tokens[1:]):
-                pair_counts[pair] += freq
-        # 如果已经没有任何 pair 可以合并了
-        if not pair_counts:
-            break
-
-
-        # 现在就有了每一个小pair的计数 
-
-        # print(pair_counts.most_common(20)) # 测试当前pre-tokenizer是否正确
-        # uv run --locked python -c 'from cs336_basics.bpe import train_bpe; train_bpe("tests/fixtures/corpus.en", 500, ["<|endoftext|>"])'
-
-        ## 然后是BPEmerge
-        best_pair = max(
-            pair_counts,
-            key=lambda pair:(pair_counts[pair],pair)
+    for special_token in special_tokens_tuple:
+        encoded_special = (
+            special_token.encode("utf-8")
         )
-        # best_pair 是一个元组
-    
-        # 之所以要有new_token是因为vocab这个dict里面的value是bytes，所以需要对齐
-        new_token = best_pair[0]+best_pair[1]
-        # 用一个list来记录合并过程
-        merges.append(best_pair)
 
-        # 之所以要有new_token是因为vocab这个dict里面的value是bytes，所以需要对齐
-        vocab[len(vocab)] = new_token
+        if encoded_special not in existing_tokens:
+            vocab[len(vocab)] = encoded_special
+            existing_tokens.add(encoded_special)
 
-        new_word_counts = Counter()
+    if vocab_size < len(vocab):
+        raise ValueError(
+            f"vocab_size={vocab_size} is smaller "
+            f"than the initial vocabulary size "
+            f"{len(vocab)}"
+        )
+    default_processes = min(
+        8,
+        os.cpu_count()
+    )
 
-        for tokens, freq in word_counts.items():
-            new_tokens = merge_pair(tokens,best_pair)   
-            new_word_counts[new_tokens] += freq
+    num_processes = max(
+        i,
+        int(
+            kwargs.get(
+                "num_processes",
+                default_processes,
+            )
+        )
+    )
+    parallel_min_bytes = int(
+        kwargs.get(
+            "parallel_min_bytes",
+            8 * 1024 * 1024,
+        )
+    )
 
-        # 更新进入下一轮
-        word_counts = new_word_counts
+    num_chunks = max(
+        num_processes,
+        int(
+            kwargs.get(
+                "num_chunks",
+                num_processes * 4,
+            )
+        ),
+    )
+
+    # 上面是一些参数
+
+    pretoken_counts = _count_pretokens(
+        input_path=input_path,
+        special_tokens=special_tokens_tuple,
+        num_processes=num_processes,
+        parallel_min_bytes=parallel_min_bytes,
+        num_chunks=num_chunks,
+    )
+    # 现在得到了返回的一个counter记录对应的单词和次数
+
+    # 这个有平替，是用来辅助把bytes拆分成多个bytes的，详见笔记
+    one_byte_tokens = tuple(
+        bytes([byte_value])
+        for byte_value in range(256)
+    )
 
 
+    # 把bytes拆分成多个bytes
+    # pretoken_counts = {
+    #     b"hi": 3,
+    #     b"!": 2,
+    # }
+    # 最终：
+    # words = [
+    #     (b"h", b"i"),
+    #     (b"!",),
+    # ]
+    words: list[tuple[bytes,...]] = [
+        tuple(
+            one_byte_tokens[byte_value]
+            for byte_value in pretoken
+        )
+        for pretoken in pretoken_counts
+    ]
 
+    # 和上面words一一对应的list，利用pretoken_counts元组的特性来记录数字
+    frequencies: list[int] = [
+        pretoken_counts[pretoken]
+        for pretoken in pretoken_counts
+    ]
 
-    return vocab, merges
+    # 举例
+    # pair_counts = Counter({
+    #     (b"l", b"l"): 5,
+    #     (b"h", b"e"): 3,
+    #     (b"e", b"l"): 3,
+    #     (b"l", b"o"): 3,
+    # })
+    pair_counts: Counter[
+        tuple[bytes,bytes]
+    ] = Counter()
+
+    # pair_to_word_ids = {
+    #     (b"h", b"e"): {0, 3},
+    #     (b"e", b"l"): {0},
+    #     (b"l", b"l"): {0, 2},
+    # }
+    #
+    # 表示：
+    # (b"h", b"e") 这个 pair 出现在编号 0、3 的 word 中
+    # (b"e", b"l") 这个 pair 出现在编号 0 的 word 中
+    # (b"l", b"l") 这个 pair 出现在编号 0、2 的 word 中
+    #
+
+    pair_to_word_ids: dict[
+        tuple[bytes,bytes],
+        set[int],
+    ] = defaultdict(set)
+
+    for word_id,(
+        tokens,
+        frequency,
+        ) in enumerate(
+            zip(words, frequencies)
+        ):
+        local_counts = (
+            _adjacent_pair_counts(tokens)# 详细见函数定义ctrl+鼠标左键，返回一个counter
+        )
+        # 读取这个计数器里的内容
+        # 例：
+        # 假设当前：
+        # tokens = (b"h", b"e", b"l", b"l", b"o")
+        # local_counts = Counter({
+        #     (b"h", b"e"): 1,
+        #     (b"e", b"l"): 1,
+        #     (b"l", b"l"): 1,
+        #     (b"l", b"o"): 1,
+        # })
+        for pair, occurrences in (
+            local_counts.items()
+        ):
+            pair_counts[pair] += (
+                occurrences * frequency
+            )
+
+            pair_to_word_ids[pair].add(
+                word_id
+            )
+
+    # 以上就有了pair_counts
+    # pair_counts = Counter({
+    #     (b"l", b"l"): 5,
+    #     (b"h", b"e"): 3,
+    #     (b"e", b"l"): 3,
+    #     (b"l", b"o"): 3,
+    # })
+
+    heap: list[_HeapItem] = [
+        _HeapItem(frequency, pair)
+        for pair, frequency
+        in pair_counts.items()
+    ]
+    # 把pair_counts构建成了一个堆来方便排序和取出
+
+    # 整理堆
+    heapq.heapify(heap)
+
+    # 记录每一次合并
+    merges: list[
+        tuple[bytes,bytes]
+    ] = []
+
+    # 准备进入主循环
