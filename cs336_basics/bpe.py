@@ -104,7 +104,7 @@ def find_chunk_boundaries(
                 boundaries[boundary_index] = position + found_at
                 break
 
-                position = position + mini_chunk_size
+            position = position + mini_chunk_size
 
     return sorted(set(boundaries))
 
@@ -287,8 +287,8 @@ def _count_pretokens(
             tasks,# 这里是接受一个迭代器/可迭代对象？作为输入参数，非常合适
             chunksize=1,
         )
-    for partial_counts in partial_results:
-        total_counts.update(partial_counts)
+        for partial_counts in partial_results:
+            total_counts.update(partial_counts)
 
     return total_counts
 
@@ -388,7 +388,7 @@ def train_bpe(
     )
 
     num_processes = max(
-        i,
+        1,
         int(
             kwargs.get(
                 "num_processes",
