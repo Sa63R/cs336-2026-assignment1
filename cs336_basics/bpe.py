@@ -106,7 +106,7 @@ def train_bpe(
         new_word_counts = Counter()
 
         for tokens, freq in word_counts.items():
-            new_tokens = merge_pair(tokens,best_pair)
+            new_tokens = merge_pair(tokens,best_pair)   
             new_word_counts[new_tokens] += freq
 
         # 更新进入下一轮

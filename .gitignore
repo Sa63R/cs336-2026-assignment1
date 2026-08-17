@@ -208,3 +208,7 @@ logs/
 submission/
 *.zip
 *.tar.gz
+
+# Local AI assistant instructions
+AGENTS.md
+CLAUDE.md
