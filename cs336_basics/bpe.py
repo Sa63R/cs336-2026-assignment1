@@ -537,3 +537,197 @@ def train_bpe(
     ] = []
 
     # 准备进入主循环
+    while len(vocab) < vocab_size:
+        best_pair = _pop_best_pair(
+            heap,
+            pair_counts,
+        )
+
+        if best_pair is None:
+            break
+
+        new_token = (
+            best_pair[0]+best_pair[1]
+        )
+
+        merges.append(best_pair)
+        vocab[len(vocab)] = new_token
+
+        affected_word_ids = tuple(
+            pair_to_word_ids.get(
+                best_pair,
+                (),#所以这里括号其实没什么含义
+            )
+        )# 这里的返回值是一个set
+
+        # 这个应该是最后用来调整计数的
+        pair_deltas: Counter[
+            tuple[bytes,bytes]
+        ] = Counter()
+
+        # word_id是set里取出来的序号，对每一个受影响的word合并然后重算然后排除
+        for word_id in affected_word_ids:
+            old_tokens = words[word_id]
+
+            # 合并
+            new_tokens = merge_pair(
+                old_tokens,
+                best_pair,
+            )
+
+            if new_tokens == old_tokens:
+                continue
+
+            frequency = frequencies[word_id]# 对应的次数
+
+            # 例：
+            # 假设：
+            # old_tokens = (b"a", b"b", b"a")
+            #
+            # 如果本轮要合并：
+            # best_pair = (b"a", b"b")
+            #
+            # 那么合并后：
+            # new_tokens = (b"ab", b"a")
+            #
+            # 合并前的相邻 pair：
+            # (b"a", b"b")
+            # (b"b", b"a")
+            #
+            # 所以：
+            # old_local_counts = Counter({
+            #     (b"a", b"b"): 1,
+            #     (b"b", b"a"): 1,
+            # })
+
+            old_local_counts = (
+                _adjacent_pair_counts(
+                    old_tokens
+                )
+            )
+            # 合并后的相邻 pair：
+            # (b"ab", b"a")
+            #
+            # 所以：
+            # new_local_counts = Counter({
+            #     (b"ab", b"a"): 1,
+            # })
+            new_local_counts = (
+                _adjacent_pair_counts(
+                    new_tokens
+                )
+            )
+            # 分别计数旧的和新的情况的pair
+
+            old_pairs = set(
+                old_local_counts
+            )
+            # counter转成set，只遍历key，所以类似这样
+            # old_pairs = {
+            #     (b"a", b"b"),
+            #     (b"b", b"a"),
+            # }
+            #
+
+            new_pairs = set(
+                new_local_counts
+            )
+
+            for pair in (
+                old_pairs - new_pairs # 合并之后消失了哪些 pair
+            ):
+                pair_to_word_ids[
+                    pair
+                ].discard(word_id) 
+
+                #for word_id in affected_word_ids:
+                # word_id是set里取出来的序号
+            
+            # 同样的，对于这个单词，合并后，也会受新合并token影响
+
+            for pair in (
+                new_pairs - old_pairs
+            ):
+                pair_to_word_ids[
+                    pair
+                ].add(word_id)
+
+            for pair in (
+                old_pairs | new_pairs
+            ):
+                old_count = (
+                    old_local_counts.get(
+                        pair,
+                        0,
+                    )
+                )
+
+                new_count = (
+                    new_local_counts.get(
+                        pair,
+                        0,
+                    )
+                )
+
+                # new_count - old_count 不一定是 ±1，
+                # 因为同一个 pair 在一个 word 中可能出现多次。
+                # 例：(a,b,a,b) 中 (a,b) 出现 2 次，
+                # 合并后变成 (ab,ab)，出现 0 次，
+                # 所以 new_count - old_count = 0 - 2 = -2。
+                # 不过大意也就是一个计数
+
+                delta = (
+                    new_count - old_count
+                ) * frequency
+
+                # frequency仅是这个单词出现的次数，还可能会有其他单词同样对
+                # counter产生影响，但是那就在下一个循环里体现了
+
+                if delta:
+                    pair_deltas[pair] += delta
+
+            words[word_id] = new_tokens # 把合并后的word放进去
+
+        # 循环每一个受影响的word，终于得到了总的
+
+        for pair, delta in(
+            pair_deltas.items()
+        ):
+            updated_frequency = (
+                pair_counts.get(pair, 0)
+                + delta
+            )
+            # 即使更新后也不可能小于零
+            if updated_frequency < 0:
+                raise RuntimeError(
+                    "negative pair count for "
+                    f"{pair!r}: "
+                    f"{updated_frequency}"
+                )
+            if updated_frequency == 0:
+                pair_counts.pop(
+                    pair,
+                    None,
+                )
+                if not pair_to_word_ids.get(
+                    pair
+                ):
+                    pair_to_word_ids.pop(
+                        pair,
+                        None,
+                    )
+            else:
+                pair_counts[pair] = (
+                    updated_frequency
+                )
+                # 这里还有小巧思，因为pair是只要有delta（更新）的，
+                # 就会被遍历到，所以heappush就可以把每一个更新后的pair
+                # 给重新塞回堆里
+                heapq.heappush(
+                    heap,
+                    _HeapItem(
+                        updated_frequency,
+                        pair,
+                    ),
+                )
+    return vocab, merges
