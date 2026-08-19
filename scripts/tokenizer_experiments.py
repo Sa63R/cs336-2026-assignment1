@@ -207,6 +207,117 @@ def measure(
         throughput_bytes_per_second,
     )
 
+def benchmark_throughput(
+    label: str,
+    tokenizer: Tokenizer,
+    input_path: Path,
+) -> tuple[float, float]:
+    """
+    流式编码完整文件，测量端到端吞吐量，
+    并估算处理 825 GB 文本需要的时间。
+
+    返回：
+        throughput_bytes_per_second
+        estimated_days
+    """
+    input_size_bytes = (
+        input_path.stat().st_size
+    )
+
+    # 先运行一个很小的编码，减少首次调用带来的
+    # 初始化和缓存开销对 benchmark 的影响。
+    tokenizer.encode(
+        "Tokenizer benchmark warmup."
+        + SPECIAL_TOKEN
+    )
+
+    print(f"\n{label}")
+    print(f"  输入文件：{input_path}")
+    print(
+        "  输入大小："
+        f"{input_size_bytes / 1024**2:.2f} MiB"
+    )
+    print(
+        "  正在进行流式编码，"
+        "这个过程可能需要几分钟……"
+    )
+
+    total_tokens = 0
+
+    start_time = perf_counter()
+
+    with input_path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        for _token_id in (
+            tokenizer.encode_iterable(file)
+        ):
+            total_tokens += 1
+
+    elapsed_seconds = (
+        perf_counter() - start_time
+    )
+
+    throughput_bytes_per_second = (
+        input_size_bytes / elapsed_seconds
+    )
+
+    throughput_mib_per_second = (
+        throughput_bytes_per_second
+        / 1024**2
+    )
+
+    # 题目中的 GB 按十进制计算：
+    # 1 GB = 1,000,000,000 bytes。
+    pile_size_bytes = (
+        825 * 1_000_000_000
+    )
+
+    estimated_seconds = (
+        pile_size_bytes
+        / throughput_bytes_per_second
+    )
+
+    estimated_hours = (
+        estimated_seconds / 3600
+    )
+
+    estimated_days = (
+        estimated_seconds / 86400
+    )
+
+    print(f"  产生词元数：{total_tokens:,}")
+    print(
+        f"  实际耗时："
+        f"{elapsed_seconds:.2f} 秒"
+    )
+    print(
+        "  吞吐量："
+        f"{throughput_bytes_per_second:,.2f} "
+        "字节/秒"
+    )
+    print(
+        "  吞吐量："
+        f"{throughput_mib_per_second:.2f} "
+        "MiB/s"
+    )
+    print("\n  Pile 825 GB 时间估算：")
+    print(
+        f"  秒：{estimated_seconds:,.2f}"
+    )
+    print(
+        f"  小时：{estimated_hours:.2f}"
+    )
+    print(
+        f"  天：{estimated_days:.2f}"
+    )
+
+    return (
+        throughput_bytes_per_second,
+        estimated_days,
+    )
+
 
 def main() -> None:
     tiny_tokenizer = load_tokenizer(
@@ -300,6 +411,19 @@ def main() -> None:
     print(
         "  压缩率下降了 "
         f"{compression_decrease_percentage:.2f}%"
+    )
+    # 题目 (c)：在较大的 OWT 验证集上
+    # 测量流式编码吞吐量。
+    benchmark_throughput(
+        label=(
+            "题目 (c)："
+            "OpenWebText 分词器吞吐量"
+        ),
+        tokenizer=owt_tokenizer,
+        input_path=(
+            PROJECT_ROOT
+            / "data/owt_valid.txt"
+        ),
     )
 
 
