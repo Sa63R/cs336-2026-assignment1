@@ -11,7 +11,7 @@ PRETOKEN_RE = regex.compile(PAT)
 
 
 class Tokenizer:
-    def __init(
+    def __init__(
         self,
         vocab: dict[int,bytes],
         merges: list[tuple[bytes, bytes]],
@@ -37,7 +37,7 @@ class Tokenizer:
         }
 
         self.one_byte_tokens = tuple(
-            bytes[(byte_value)]
+            bytes([byte_value])
             for byte_value in range(256)
         )
 
@@ -45,7 +45,7 @@ class Tokenizer:
             special_tokens or []
         )
 
-        self.special_tokens_to_id: dict[
+        self.special_token_to_id: dict[
             str,
             int,
         ] = {}
@@ -154,6 +154,7 @@ class Tokenizer:
         )
 
     # 这个是之前写过的函数
+    @staticmethod
     def _merge_pair(
         tokens: tuple[bytes, ...],
         pair: tuple[bytes, bytes],
