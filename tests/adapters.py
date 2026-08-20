@@ -21,6 +21,7 @@ from cs336_basics.model import (
     SwiGLU,
     scaled_dot_product_attention,
     silu,
+    TransformerBlock
 )
 
 from cs336_basics.nn_utils import softmax
@@ -366,8 +367,18 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    block = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        device=weights["ln1.weight"].device,
+        dtype=weights["ln1.weight"].dtype,
+    )
+    block.load_state_dict(weights)
 
+    return block(in_features)
 
 def run_transformer_lm(
     vocab_size: int,
