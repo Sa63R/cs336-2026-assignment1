@@ -300,3 +300,88 @@ def scaled_dot_product_attention(
         attention_weights,
         V,
     )
+
+
+class CausalMultiHeadSelfAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by num_heads"
+            )
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+
+        self.q_proj = Linear(
+            d_model,
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.k_proj = Linear(
+            d_model,
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.v_proj = Linear(
+            d_model,
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.output_proj = Linear(
+            d_model,
+            d_model,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.unflatten(
+            -1,
+            (self.num_heads, self.d_head),
+        ).transpose(-3, -2)
+
+        k = k.unflatten(
+            -1,
+            (self.num_heads, self.d_head),
+        ).transpose(-3, -2)
+
+        v = v.unflatten(
+            -1,
+            (self.num_heads, self.d_head),
+        ).transpose(-3, -2)
+
+        sequence_length = x.shape[-2]
+
+        causal_mask = torch.tril(
+            torch.ones(
+                sequence_length,
+                sequence_length,
+                device=x.device,
+                dtype=torch.bool,
+            )
+        )
+
+        context = scaled_dot_product_attention(
+            Q=q,
+            K=k,
+            V=v,
+            mask=causal_mask,
+        )
+
+        context = context.transpose(-3, -2).flatten(-2)
+        
+        return self.output_proj(context)

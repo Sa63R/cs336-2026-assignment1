@@ -13,6 +13,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.model import (
+    CausalMultiHeadSelfAttention,
     Embedding,
     Linear,
     RMSNorm,
@@ -186,7 +187,23 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    attention = CausalMultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        device=q_proj_weight.device,
+        dtype=q_proj_weight.dtype,
+    )
+
+    attention.load_state_dict(
+        {
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "output_proj.weight": o_proj_weight,
+        }
+    )
+
+    return attention(in_features)
 
 
 def run_multihead_self_attention_with_rope(
