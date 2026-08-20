@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator
 
 import regex
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 PRETOKEN_RE = regex.compile(PAT)
+PRETOKEN_CACHE_MAX_SIZE = 100_000
 
 
 class Tokenizer:
@@ -40,6 +42,14 @@ class Tokenizer:
             bytes([byte_value])
             for byte_value in range(256)
         )
+
+        # 同一个预词元通常会在语料中重复出现很多次。缓存其最终
+        # token ID 序列，可以跳过重复的 BPE 合并和 bytes -> ID 查询。
+        # 使用有界 LRU 缓存，避免处理大型语料时内存无限增长。
+        self._pretoken_id_cache: OrderedDict[
+            bytes,
+            tuple[int, ...],
+        ] = OrderedDict()
 
         self.special_tokens = list(
             special_tokens or []
@@ -235,6 +245,48 @@ class Tokenizer:
             )
         return tokens
 
+    def _encode_pretoken(
+        self,
+        pretoken_bytes: bytes,
+    ) -> tuple[int, ...]:
+        """将一个预词元编码为 ID，并缓存重复预词元的结果。"""
+
+        cached_token_ids = (
+            self._pretoken_id_cache.get(
+                pretoken_bytes
+            )
+        )
+
+        if cached_token_ids is not None:
+            # 最近访问的条目移到末尾；缓存满时优先淘汰最久
+            # 没有使用的条目。
+            self._pretoken_id_cache.move_to_end(
+                pretoken_bytes
+            )
+            return cached_token_ids
+
+        bpe_tokens = self._apply_bpe(
+            pretoken_bytes
+        )
+        token_ids = tuple(
+            self.token_to_id[token]
+            for token in bpe_tokens
+        )
+
+        self._pretoken_id_cache[
+            pretoken_bytes
+        ] = token_ids
+
+        if (
+            len(self._pretoken_id_cache)
+            > PRETOKEN_CACHE_MAX_SIZE
+        ):
+            self._pretoken_id_cache.popitem(
+                last=False
+            )
+
+        return token_ids
+
     def _encode_ordinary_text(
         self,
         text: str,
@@ -247,13 +299,9 @@ class Tokenizer:
             pretoken_bytes = (
                 match.group().encode("utf-8")
             )
-
-            bpe_tokens = self._apply_bpe(
+            yield from self._encode_pretoken(
                 pretoken_bytes
             )
-
-            for token in bpe_tokens:
-                yield self.token_to_id[token]
 
     def _encode_text(
         self,
