@@ -309,6 +309,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
         num_heads: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        theta: float | None = None,
+        max_seq_len: int | None = None,
     ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
@@ -343,8 +345,25 @@ class CausalMultiHeadSelfAttention(nn.Module):
             device=device,
             dtype=dtype,
         )
+        if (theta is None) != (max_seq_len is None):
+            raise ValueError(
+                "theta and max_seq_len must be provided together"
+            )
+        self.rope = None
+        if theta is not None and max_seq_len is not None:
+            self.rope = RotaryPositionalEmbedding(
+                theta=theta,
+                d_k=self.d_head,
+                max_seq_len=max_seq_len,
+                device=device,
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            token_positions: torch.Tensor | None = None,
+        ) -> torch.Tensor:
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
@@ -365,6 +384,17 @@ class CausalMultiHeadSelfAttention(nn.Module):
         ).transpose(-3, -2)
 
         sequence_length = x.shape[-2]
+        if self.rope is not None:
+            if token_positions is None:
+                token_positions = torch.arange(
+                    sequence_length,
+                    device=x.device,
+                )
+
+            rope_positions = token_positions.unsqueeze(-2)
+
+            q = self.rope(q, rope_positions)
+            k = self.rope(k, rope_positions)
 
         causal_mask = torch.tril(
             torch.ones(
