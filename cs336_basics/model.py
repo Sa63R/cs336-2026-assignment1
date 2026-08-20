@@ -3,6 +3,8 @@ import math
 import torch
 from torch import nn
 
+from cs336_basics.nn_utils import softmax
+
 class Linear(nn.Module):
     def __init__(
             self,
@@ -264,3 +266,37 @@ class RotaryPositionalEmbedding(nn.Module):
             (rotated_even, rotated_odd),
             dim=-1,
         ).flatten(-2)
+
+def scaled_dot_product_attention(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+
+    # 也就是维度
+    d_k = Q.shape[-1]
+
+    attention_scores = torch.einsum(
+        "...qd,...kd->...qk",
+        Q,
+        K,
+    )
+
+    attention_scores = attention_scores / math.sqrt(d_k)
+
+    if mask is not None:
+        attention_scores = attention_scores.masked_fill(
+            ~mask,
+            float("-inf"),
+        )
+
+    attention_weights = softmax(
+        attention_scores,
+        dim=-1,
+    )
+    return torch.einsum(
+        "...qk,...kv->...qv",
+        attention_weights,
+        V,
+    )
