@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import json
 import os
 from collections import OrderedDict
@@ -163,87 +164,150 @@ class Tokenizer:
             special_tokens=special_tokens,
         )
 
-    # 这个是之前写过的函数
-    @staticmethod
-    def _merge_pair(
-        tokens: tuple[bytes, ...],
-        pair: tuple[bytes, bytes],
-    ) -> tuple[bytes, ...]:
-        """
-        从左到右、不重叠地合并指定 pair。
-        """
-
-        result: list[bytes] = []
-        index = 0
-
-        while index < len(tokens):
-            if (
-                index + 1 < len(tokens)
-                and tokens[index] == pair[0]
-                and tokens[index + 1]
-                == pair[1]
-            ):
-                result.append(
-                    tokens[index]
-                    + tokens[index + 1]
-                )
-                index += 2
-            else:
-                result.append(tokens[index])
-                index += 1
-
-        return tuple(result)
-
-    # 执行merge的核心函数
     def _apply_bpe(
         self,
-        pretoken_bytes: bytes,            
-    ) -> tuple[bytes,...]:
+        pretoken_bytes: bytes,
+    ) -> tuple[bytes, ...]:
         """
         对一个预词元应用已有的 BPE merges。
 
-        编码时选择
-        merges 中创建时间最早、rank 最小的可用 pair。
+        使用最小堆选择 rank 最小的相邻 pair，并用双向链表
+        维护仍然存活的 token。每次合并后只更新左右邻居，
+        不再反复扫描和重建整个 token 序列。
         """
-        tokens = tuple(
+        tokens = [
             self.one_byte_tokens[byte_value]
             for byte_value in pretoken_bytes
-        )
+        ]
 
-        # 下面是一个非常美丽的单token，merge循环，最后返还merge完后的token
+        token_count = len(tokens)
+        if token_count < 2:
+            return tuple(tokens)
 
-        while len(tokens) >= 2:
-            best_pair: (
-                tuple[bytes,bytes] | None
-            ) = None
+        previous_indices = [
+            index - 1
+            for index in range(token_count)
+        ]
+        next_indices = [
+            index + 1
+            if index + 1 < token_count
+            else -1
+            for index in range(token_count)
+        ]
+        alive = [True] * token_count
 
-            best_rank = len(self.merges)
+        # heap 元素为 (merge rank, 左 token 下标, 右 token 下标)。
+        # 下标同时让同一 pair 的重叠出现按从左到右处理。
+        merge_heap: list[
+            tuple[int, int, int]
+        ] = []
 
-            # 这里最巧妙的地方在于取了所有可能merge的组合一个个查，然后比较得到最高优先级的那个，如果没有那么就没有（不重不漏）
-            for pair in zip (
-                tokens,
-                tokens[1:],
-            ):
-                rank = self.merge_ranks.get(pair)
+        def push_candidate(
+            left_index: int,
+        ) -> None:
+            if left_index == -1:
+                return
 
-                if(
-                    rank is not None
-                    and rank < best_rank
-                ):
-                    best_pair = pair
-                    best_rank = rank
+            right_index = next_indices[left_index]
+            if right_index == -1:
+                return
 
-            # 如果无法合并，则break
-            if best_pair is None:
-                break
-
-            # else
-
-            tokens = self._merge_pair(
-                tokens,
-                best_pair,
+            rank = self.merge_ranks.get(
+                (
+                    tokens[left_index],
+                    tokens[right_index],
+                )
             )
-        return tokens
+
+            if rank is not None:
+                heapq.heappush(
+                    merge_heap,
+                    (
+                        rank,
+                        left_index,
+                        right_index,
+                    ),
+                )
+
+        for left_index in range(
+            token_count - 1
+        ):
+            push_candidate(left_index)
+
+        while merge_heap:
+            selected_rank = merge_heap[0][0]
+            selected_occurrences: list[
+                tuple[int, int, int]
+            ] = []
+
+            # 旧实现会在一轮中从左到右合并当前最佳 pair
+            # 的全部非重叠出现，因此先取出这一 rank 的已有项，
+            # 再统一处理。合并中新产生的候选留到下一轮。
+            while (
+                merge_heap
+                and merge_heap[0][0]
+                == selected_rank
+            ):
+                selected_occurrences.append(
+                    heapq.heappop(merge_heap)
+                )
+
+            for (
+                rank,
+                left_index,
+                right_index,
+            ) in selected_occurrences:
+                if (
+                    not alive[left_index]
+                    or not alive[right_index]
+                    or next_indices[left_index]
+                    != right_index
+                ):
+                    continue
+
+                current_rank = (
+                    self.merge_ranks.get(
+                        (
+                            tokens[left_index],
+                            tokens[right_index],
+                        )
+                    )
+                )
+                if current_rank != rank:
+                    continue
+
+                tokens[left_index] = (
+                    tokens[left_index]
+                    + tokens[right_index]
+                )
+                alive[right_index] = False
+
+                next_index = next_indices[
+                    right_index
+                ]
+                next_indices[left_index] = (
+                    next_index
+                )
+
+                if next_index != -1:
+                    previous_indices[next_index] = (
+                        left_index
+                    )
+
+                # 只有合并结果左右两侧的相邻 pair 发生变化。
+                push_candidate(
+                    previous_indices[left_index]
+                )
+                push_candidate(left_index)
+
+        result: list[bytes] = []
+        token_index = 0
+
+        while token_index != -1:
+            result.append(tokens[token_index])
+            token_index = next_indices[token_index]
+
+        return tuple(result)
 
     def _encode_pretoken(
         self,
