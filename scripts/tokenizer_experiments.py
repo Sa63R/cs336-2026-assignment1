@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import io
+import multiprocessing as mp
+import os
 import random
 from collections.abc import Iterator
 from pathlib import Path
 from time import perf_counter
 
+from cs336_basics.bpe import find_chunk_boundaries
 from cs336_basics.tokenizer import Tokenizer
 
 
@@ -14,6 +18,65 @@ SPECIAL_TOKEN = "<|endoftext|>"
 READ_CHUNK_SIZE = 1024 * 1024
 SAMPLE_SIZE = 10
 RANDOM_SEED = 336
+BENCHMARK_NUM_PROCESSES = min(
+    8,
+    os.cpu_count() or 1,
+)
+BENCHMARK_CHUNKS_PER_PROCESS = 2
+
+
+_WORKER_TOKENIZER: Tokenizer | None = None
+
+
+def _initialize_encode_worker(
+    vocab_filepath: str,
+    merges_filepath: str,
+    special_tokens: tuple[str, ...],
+) -> None:
+    """每个工作进程启动时只加载一次分词器。"""
+    global _WORKER_TOKENIZER
+
+    _WORKER_TOKENIZER = Tokenizer.from_files(
+        vocab_filepath=vocab_filepath,
+        merges_filepath=merges_filepath,
+        special_tokens=list(special_tokens),
+    )
+    _WORKER_TOKENIZER.encode(
+        "Tokenizer worker warmup."
+        + SPECIAL_TOKEN
+    )
+
+
+def _count_tokens_in_file_range(
+    task: tuple[int, str, int, int],
+) -> tuple[int, int, int]:
+    """在工作进程中编码一个安全文件区间并统计词元数。"""
+    if _WORKER_TOKENIZER is None:
+        raise RuntimeError(
+            "工作进程中的 Tokenizer 尚未初始化"
+        )
+
+    chunk_index, input_path, start, end = task
+
+    with open(input_path, "rb") as file:
+        file.seek(start)
+        chunk_bytes = file.read(end - start)
+
+    chunk_text = chunk_bytes.decode("utf-8")
+    token_count = sum(
+        1
+        for _token_id in (
+            _WORKER_TOKENIZER.encode_iterable(
+                io.StringIO(chunk_text)
+            )
+        )
+    )
+
+    return (
+        chunk_index,
+        len(chunk_bytes),
+        token_count,
+    )
 
 
 def iter_documents(
@@ -209,26 +272,25 @@ def measure(
 
 def benchmark_throughput(
     label: str,
-    tokenizer: Tokenizer,
+    tokenizer_directory: Path,
     input_path: Path,
+    num_processes: int,
 ) -> tuple[float, float]:
     """
-    流式编码完整文件，测量端到端吞吐量，
-    并估算处理 825 GB 文本需要的时间。
+    使用单进程或多进程流式编码完整文件，测量端到端
+    吞吐量，并估算处理 825 GB 文本需要的时间。
 
     返回：
         throughput_bytes_per_second
         estimated_days
     """
+    if num_processes <= 0:
+        raise ValueError(
+            "num_processes 必须是正整数"
+        )
+
     input_size_bytes = (
         input_path.stat().st_size
-    )
-
-    # 先运行一个很小的编码，减少首次调用带来的
-    # 初始化和缓存开销对 benchmark 的影响。
-    tokenizer.encode(
-        "Tokenizer benchmark warmup."
-        + SPECIAL_TOKEN
     )
 
     print(f"\n{label}")
@@ -237,23 +299,127 @@ def benchmark_throughput(
         "  输入大小："
         f"{input_size_bytes / 1024**2:.2f} MiB"
     )
-    print(
-        "  正在进行流式编码，"
-        "这个过程可能需要几分钟……"
-    )
+    print(f"  编码进程数：{num_processes}")
 
-    total_tokens = 0
+    if num_processes == 1:
+        tokenizer = load_tokenizer(
+            tokenizer_directory
+        )
+        tokenizer.encode(
+            "Tokenizer benchmark warmup."
+            + SPECIAL_TOKEN
+        )
 
-    start_time = perf_counter()
+        print("  正在进行单进程流式编码……")
+        start_time = perf_counter()
+        total_tokens = 0
 
-    with input_path.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
-        for _token_id in (
-            tokenizer.encode_iterable(file)
-        ):
-            total_tokens += 1
+        with input_path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            for _token_id in (
+                tokenizer.encode_iterable(file)
+            ):
+                total_tokens += 1
+
+        processed_bytes = input_size_bytes
+        chunk_count = 1
+    else:
+        desired_num_chunks = (
+            num_processes
+            * BENCHMARK_CHUNKS_PER_PROCESS
+        )
+
+        with input_path.open("rb") as file:
+            boundaries = find_chunk_boundaries(
+                file=file,
+                desired_num_chunks=(
+                    desired_num_chunks
+                ),
+                split_special_tokens=(
+                    SPECIAL_TOKEN.encode("utf-8")
+                ),
+            )
+
+        tasks = [
+            (
+                chunk_index,
+                os.fspath(input_path),
+                start,
+                end,
+            )
+            for chunk_index, (start, end)
+            in enumerate(
+                zip(
+                    boundaries[:-1],
+                    boundaries[1:],
+                )
+            )
+            if start < end
+        ]
+
+        process_count = min(
+            num_processes,
+            len(tasks),
+        )
+        chunk_count = len(tasks)
+
+        print(
+            f"  安全文本块数：{chunk_count}"
+        )
+        print("  正在进行多进程流式编码……")
+
+        context = mp.get_context("fork")
+        start_time = perf_counter()
+
+        with context.Pool(
+            processes=process_count,
+            initializer=_initialize_encode_worker,
+            initargs=(
+                os.fspath(
+                    tokenizer_directory
+                    / "vocab.json"
+                ),
+                os.fspath(
+                    tokenizer_directory
+                    / "merges.json"
+                ),
+                (SPECIAL_TOKEN,),
+            ),
+        ) as pool:
+            partial_results = pool.imap(
+                _count_tokens_in_file_range,
+                tasks,
+                chunksize=1,
+            )
+            ordered_results = list(
+                partial_results
+            )
+
+        processed_bytes = sum(
+            chunk_bytes
+            for (
+                _chunk_index,
+                chunk_bytes,
+                _token_count,
+            ) in ordered_results
+        )
+        total_tokens = sum(
+            token_count
+            for (
+                _chunk_index,
+                _chunk_bytes,
+                token_count,
+            ) in ordered_results
+        )
+
+        if processed_bytes != input_size_bytes:
+            raise RuntimeError(
+                "多进程切块没有完整覆盖输入文件："
+                f"处理了 {processed_bytes} 字节，"
+                f"文件共有 {input_size_bytes} 字节"
+            )
 
     elapsed_seconds = (
         perf_counter() - start_time
@@ -288,6 +454,7 @@ def benchmark_throughput(
     )
 
     print(f"  产生词元数：{total_tokens:,}")
+    print(f"  实际文本块数：{chunk_count}")
     print(
         f"  实际耗时："
         f"{elapsed_seconds:.2f} 秒"
@@ -419,10 +586,16 @@ def main() -> None:
             "题目 (c)："
             "OpenWebText 分词器吞吐量"
         ),
-        tokenizer=owt_tokenizer,
+        tokenizer_directory=(
+            PROJECT_ROOT
+            / "artifacts/tokenizers/owt"
+        ),
         input_path=(
             PROJECT_ROOT
             / "data/owt_valid.txt"
+        ),
+        num_processes=(
+            BENCHMARK_NUM_PROCESSES
         ),
     )
 
