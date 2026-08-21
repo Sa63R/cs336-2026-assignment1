@@ -31,6 +31,9 @@ from cs336_basics.nn_utils import (
     gradient_clipping,
     softmax,
 )
+from cs336_basics.data import get_batch
+
+
 
 
 def run_linear(
@@ -544,7 +547,12 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    return get_batch(
+        dataset=dataset,
+        batch_size=batch_size,
+        context_length=context_length,
+        device=device,
+    )
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
