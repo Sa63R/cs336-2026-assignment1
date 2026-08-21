@@ -1,4 +1,6 @@
 import torch
+from collections.abc import Iterable
+
 
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     max_value = x.max(dim=dim, keepdim=True).values
@@ -32,3 +34,36 @@ def cross_entropy(
     losses = log_partition - target_logits
 
     return losses.mean()
+
+def gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter],
+    max_l2_norm: float,
+) -> None:
+    gradients = [
+        parameter.grad
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+
+    if len(gradients) == 0:
+        return
+
+    total_squared_norm = sum(
+        torch.sum(gradient.detach() ** 2)
+        for gradient in gradients
+    )
+
+    total_l2_norm = torch.sqrt(total_squared_norm)
+
+    clip_coefficient = (
+        max_l2_norm / (total_l2_norm + 1e-6)
+    )
+
+    clip_coefficient = torch.clamp(
+        clip_coefficient,
+        max=1.0,
+    )
+
+    with torch.no_grad():
+        for gradient in gradients:
+            gradient.mul_(clip_coefficient)
