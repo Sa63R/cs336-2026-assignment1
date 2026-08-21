@@ -128,3 +128,34 @@ class AdamW(torch.optim.Optimizer):
                 )
 
         return loss
+
+def get_lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+) -> float:
+    # 第一阶段：线性预热
+    if it < warmup_iters:
+        return max_learning_rate * it / warmup_iters
+
+    # 第二阶段：余弦退火
+    if it <= cosine_cycle_iters:
+        progress = (
+            (it - warmup_iters)
+            / (cosine_cycle_iters - warmup_iters)
+        )
+
+        cosine_factor = 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+        return (
+            min_learning_rate
+            + cosine_factor
+            * (max_learning_rate - min_learning_rate)
+        )
+
+    # 第三阶段：保持最小学习率
+    return min_learning_rate
