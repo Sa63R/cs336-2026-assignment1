@@ -469,3 +469,92 @@ class TransformerBlock(nn.Module):
         )
 
         return x
+    
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+
+        self.token_embeddings = Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=d_model,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    max_seq_len=context_length,
+                    theta=rope_theta,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.ln_final = RMSNorm(
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.lm_head = Linear(
+            in_features=d_model,
+            out_features=vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+
+        # 这里写的是整个大模型的输入，所以输入的是token的id而不是embedding
+
+    def forward(
+        self,
+        in_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        sequence_length = in_indices.shape[-1]
+
+        if sequence_length > self.context_length:
+            raise ValueError(
+                f"Input sequence length {sequence_length} exceeds "
+                f"context length {self.context_length}"
+            )
+
+        token_positions = torch.arange(
+            sequence_length,
+            device=in_indices.device,
+        )
+
+        x = self.token_embeddings(in_indices)
+
+        for layer in self.layers:
+            x = layer(
+                x,
+                token_positions=token_positions,
+            )
+
+        x = self.ln_final(x)
+        logits = self.lm_head(x)
+
+        return logits
