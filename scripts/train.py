@@ -6,6 +6,7 @@ from time import perf_counter
 
 import numpy as np
 import torch
+import wandb
 
 from cs336_basics.checkpoint import (
     load_checkpoint,
@@ -79,6 +80,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-iters", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--run-name", required=True)
+    parser.add_argument(
+        "--wandb-project",
+        default="cs336-assignment1",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline", "disabled"),
+        default="offline",
+    )
 
     parser.add_argument("--seed", type=int, default=336)
     parser.add_argument(
@@ -168,6 +179,17 @@ def main() -> None:
             "cosine_cycle_iters"
         )
 
+    for argument_name in (
+        "log_every",
+        "eval_every",
+        "eval_iters",
+        "save_every",
+    ):
+        if getattr(args, argument_name) <= 0:
+            raise ValueError(
+                f"{argument_name} must be positive"
+            )
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -236,10 +258,53 @@ def main() -> None:
             f"at iteration {start_iteration}"
         )
 
+    wandb_config = {
+        key: (
+            str(value)
+            if isinstance(value, Path)
+            else value
+        )
+        for key, value in vars(args).items()
+    }
+
+    run = wandb.init(
+        project=args.wandb_project,
+        name=args.run_name,
+        mode=args.wandb_mode,
+        config={
+            **wandb_config,
+            "parameter_count": parameter_count,
+            "train_tokens": len(train_data),
+            "validation_tokens": len(val_data),
+        },
+    )
+
+    # 每条损失记录都带有梯度步数和实际经过时间，W&B 中可以
+    # 分别选择它们作为横轴绘制学习曲线。
+    run.define_metric("gradient_step")
+    run.define_metric("elapsed_seconds")
+    run.define_metric(
+        "train/*",
+        step_metric="gradient_step",
+    )
+    run.define_metric(
+        "validation/*",
+        step_metric="gradient_step",
+    )
+
     model.train()
 
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+    training_start_time = perf_counter()
     last_log_time = perf_counter()
     last_log_iteration = start_iteration
+    train_loss_sum = torch.zeros(
+        (),
+        device=args.device,
+    )
+    train_loss_count = 0
 
     for iteration in range(
         start_iteration,
@@ -285,12 +350,19 @@ def main() -> None:
 
         optimizer.step()
 
+        # 在 GPU 上累加，避免每一步调用 loss.item() 导致同步。
+        train_loss_sum += loss.detach()
+        train_loss_count += 1
+
         # iteration 从 0 开始，completed_steps 表示已完成步数。
         completed_steps = iteration + 1
+
+        metrics: dict[str, int | float] = {}
 
         should_log = (
             completed_steps == 1
             or completed_steps % args.log_every == 0
+            or completed_steps == args.max_iters
         )
 
         if should_log:
@@ -309,16 +381,30 @@ def main() -> None:
             tokens_per_second = (
                 tokens_processed / elapsed
             )
+            average_train_loss = (
+                train_loss_sum.item()
+                / train_loss_count
+            )
 
             print(
                 f"step={completed_steps:7d} "
-                f"train_loss={loss.item():.6f} "
+                f"train_loss={average_train_loss:.6f} "
                 f"lr={learning_rate:.3e} "
                 f"tokens/s={tokens_per_second:,.0f}"
             )
 
+            metrics.update(
+                {
+                    "train/loss": average_train_loss,
+                    "train/learning_rate": learning_rate,
+                    "train/tokens_per_second": tokens_per_second,
+                }
+            )
+
             last_log_time = current_time
             last_log_iteration = completed_steps
+            train_loss_sum.zero_()
+            train_loss_count = 0
 
         should_evaluate = (
             completed_steps % args.eval_every == 0
@@ -340,6 +426,31 @@ def main() -> None:
                 f"validation_loss={validation_loss:.6f}"
             )
 
+            metrics["validation/loss"] = validation_loss
+
+        if metrics:
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
+
+            elapsed_seconds = (
+                perf_counter()
+                - training_start_time
+            )
+
+            metrics.update(
+                {
+                    "gradient_step": completed_steps,
+                    "elapsed_seconds": elapsed_seconds,
+                    "tokens_seen": (
+                        completed_steps
+                        * args.batch_size
+                        * args.context_length
+                    ),
+                }
+            )
+
+            run.log(metrics)
+
         should_save = (
             completed_steps % args.save_every == 0
             or completed_steps == args.max_iters
@@ -359,6 +470,8 @@ def main() -> None:
             )
 
             print(f"saved checkpoint: {checkpoint_path}")
+
+    run.finish()
 
 
 if __name__ == "__main__":
