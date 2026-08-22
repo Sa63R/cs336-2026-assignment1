@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wandb-mode",
         choices=("online", "offline", "disabled"),
-        default="offline",
+        default="online",
     )
 
     parser.add_argument("--seed", type=int, default=336)
